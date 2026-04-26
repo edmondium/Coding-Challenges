@@ -1,4 +1,13 @@
-#include <bits/stdc++.h>
+#include <iostream>
+#include <fstream>
+#include <vector>
+#include <string>
+#include <unordered_map>
+#include <queue>
+#include <memory>
+#include <ranges>
+#include <algorithm>
+#include <iterator>
 #include <openacc.h>
 
 using namespace std;
@@ -20,11 +29,10 @@ auto frequency_table_acc(const string& text) {
         freq_arr[(unsigned char)data[i]]++;
     }
 
-    unordered_map<char, size_t> freq;
-    for (int i = 0; i < 256; ++i) {
-        if (freq_arr[i] > 0) freq[(char)i] = freq_arr[i];
-    }
-    return freq;
+    return views::iota(0, 256)
+        | views::filter([&](int i) { return freq_arr[i] > 0; })
+        | views::transform([&](int i) { return pair{(char)i, freq_arr[i]}; })
+        | ranges::to<unordered_map<char, size_t>>();
 }
 
 struct Node {
@@ -36,103 +44,115 @@ struct Node {
 auto build_tree(const unordered_map<char, size_t>& freq) {
     auto cmp = [](const auto& a, const auto& b) { return a->f > b->f; };
     priority_queue<shared_ptr<Node>, vector<shared_ptr<Node>>, decltype(cmp)> pq(cmp);
-    for (auto& [c, f] : freq) pq.push(make_shared<Node>(c, f));
-    if (pq.empty()) return shared_ptr<Node>();
+
+    ranges::for_each(freq, [&](const auto& p) {
+        pq.push(make_shared<Node>(p.first, p.second));
+    });
+
     while (pq.size() > 1) {
         auto a = pq.top(); pq.pop();
         auto b = pq.top(); pq.pop();
         pq.push(make_shared<Node>('\0', a->f + b->f, a, b));
     }
-    return pq.top();
+    return pq.empty() ? nullptr : pq.top();
 }
 
-void build_codes(shared_ptr<Node> n, string s, unordered_map<char, string>& codes) {
-    if (!n) return;
-    if (!n->l && !n->r) codes[n->c] = s.empty() ? "0" : s;
-    else {
-        build_codes(n->l, s + "0", codes);
-        build_codes(n->r, s + "1", codes);
-    }
-}
-
-void write_header(ofstream& out, const unordered_map<char, string>& codes, size_t len) {
-    uint32_t n = codes.size();
-    out.write(reinterpret_cast<const char*>(&n), sizeof(n));
-    for (auto& [c, code] : codes) {
-        out.put(c);
-        uint32_t clen = code.size();
-        out.write(reinterpret_cast<const char*>(&clen), sizeof(clen));
-        out.write(code.data(), clen);
-    }
-    uint64_t total = len;
-    out.write(reinterpret_cast<const char*>(&total), sizeof(total));
+auto get_codes(shared_ptr<Node> root) {
+    unordered_map<char, string> codes;
+    auto dfs = [&](auto self, shared_ptr<Node> n, string s) -> void {
+        if (!n->l && !n->r) codes[n->c] = s.empty() ? "0" : s;
+        else {
+            if (n->l) self(self, n->l, s + "0");
+            if (n->r) self(self, n->r, s + "1");
+        }
+    };
+    if (root) dfs(dfs, root, "");
+    return codes;
 }
 
 void write_compressed(ofstream& out, const string& text, const unordered_map<char, string>& codes) {
+    auto bits = text 
+        | views::transform([&](char c) { return codes.at(c); }) 
+        | views::join;
+
     unsigned char byte = 0;
     int count = 0;
-    for (char c : text) {
-        for (char bit : codes.at(c)) {
-            if (bit == '1') byte |= (1 << (7 - count));
-            if (++count == 8) {
-                out.put(byte);
-                byte = 0;
-                count = 0;
-            }
+    for (char bit : bits) {
+        if (bit == '1') byte |= (1 << (7 - count));
+        if (++count == 8) {
+            out.put(byte);
+            byte = 0;
+            count = 0;
         }
     }
     if (count > 0) out.put(byte);
 }
 
 void decode_bitstream(ifstream& in, const unordered_map<char, string>& codes, uint64_t total, const string& outpath) {
-    unordered_map<string, char> reverse;
-    for (auto& [c, code] : codes) reverse[code] = c;
+    auto reverse_map = codes 
+        | views::transform([](const auto& p) { return pair{p.second, p.first}; })
+        | ranges::to<unordered_map<string, char>>();
+
     ofstream out(outpath, ios::binary);
     string cur;
     uint64_t written = 0;
-    char byte;
-    while (written < total && in.get(byte)) {
-        for (int i = 7; i >= 0 && written < total; --i) {
+
+    auto process_byte = [&](unsigned char byte) {
+        for (int i : views::iota(0, 8) | views::reverse) {
+            if (written >= total) return;
             cur += (byte & (1 << i)) ? '1' : '0';
-            if (reverse.contains(cur)) {
-                out.put(reverse[cur]);
+            if (auto it = reverse_map.find(cur); it != reverse_map.end()) {
+                out.put(it->second);
                 cur.clear();
                 written++;
             }
         }
-    }
+    };
+
+    ranges::for_each(istreambuf_iterator<char>(in), istreambuf_iterator<char>(), 
+        [&](char b) { process_byte(static_cast<unsigned char>(b)); });
 }
 
 int main(int argc, char** argv) {
-    if (argc != 4) return 1;
-    string mode = argv[1];
+    auto args = views::iota(0, argc) 
+        | views::transform([&](int i) { return string(argv[i]); }) 
+        | ranges::to<vector<string>>();
+
+    if (args.size() != 4) return 1;
+
     try {
-        if (mode == "-e") {
-            auto text = read_file(argv[2]);
-            auto freq = frequency_table_acc(text);
-            auto root = build_tree(freq);
-            unordered_map<char, string> codes;
-            build_codes(root, "", codes);
-            ofstream out(argv[3], ios::binary);
-            write_header(out, codes, text.size());
+        if (args[1] == "-e") {
+            auto text = read_file(args[2]);
+            auto codes = get_codes(build_tree(frequency_table_acc(text)));
+            ofstream out(args[3], ios::binary);
+            
+            uint32_t n = codes.size();
+            out.write(reinterpret_cast<char*>(&n), sizeof(n));
+            ranges::for_each(codes, [&](const auto& p) {
+                out.put(p.first);
+                uint32_t clen = p.second.size();
+                out.write(reinterpret_cast<char*>(&clen), sizeof(clen));
+                out.write(p.second.data(), clen);
+            });
+            
+            uint64_t total = text.size();
+            out.write(reinterpret_cast<char*>(&total), sizeof(total));
             write_compressed(out, text, codes);
-        } else if (mode == "-d") {
-            ifstream in(argv[2], ios::binary);
-            uint32_t n;
-            in.read(reinterpret_cast<char*>(&n), sizeof(n));
-            unordered_map<char, string> codes;
-            for (uint32_t i = 0; i < n; ++i) {
+
+        } else if (args[1] == "-d") {
+            ifstream in(args[2], ios::binary);
+            uint32_t n; in.read(reinterpret_cast<char*>(&n), sizeof(n));
+            
+            auto codes = views::iota(0u, n) | views::transform([&](auto) {
                 char c; in.get(c);
                 uint32_t len; in.read(reinterpret_cast<char*>(&len), sizeof(len));
                 string s(len, '\0'); in.read(s.data(), len);
-                codes[c] = s;
-            }
-            uint64_t total;
-            in.read(reinterpret_cast<char*>(&total), sizeof(total));
-            decode_bitstream(in, codes, total, argv[3]);
+                return pair{c, s};
+            }) | ranges::to<unordered_map<char, string>>();
+
+            uint64_t total; in.read(reinterpret_cast<char*>(&total), sizeof(total));
+            decode_bitstream(in, codes, total, args[3]);
         }
-    } catch (...) {
-        return 1;
-    }
+    } catch (...) { return 1; }
     return 0;
 }
